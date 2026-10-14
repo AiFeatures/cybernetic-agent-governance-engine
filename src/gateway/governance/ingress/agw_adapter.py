@@ -246,7 +246,9 @@ class AgwAdapter:
             claims["_verified_kid"] = kid
             return True, claims
         except Exception as exc:
-            logger.warning("AGW OIDC token verification failed: %s", exc)
+            logger.warning(
+                "AGW OIDC signature validation failed: %s", type(exc).__name__
+            )
             return False, {}
 
     def extract_tri_identity(
@@ -261,9 +263,9 @@ class AgwAdapter:
         headers_raw = raw_request.get("headers") or {}
 
         user_id = str(
-            tri_raw.get("user_id")
-            or claims.get("act_sub")
+            claims.get("act_sub")
             or claims.get("user_sub")
+            or tri_raw.get("user_id")
             or auth_raw.get("user_id")
             or headers_raw.get("x-geap-user-id")
             or ""

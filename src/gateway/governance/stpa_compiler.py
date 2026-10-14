@@ -1176,13 +1176,29 @@ def generate_python(cs: ControlStructureModel) -> str:
         elif param and op == "greater_than" and cond.threshold is not None:
             body_lines += [
                 f'            val = params.get("{param}")',
-                f"            if val is not None and float(val) > {cond.threshold}:",
-                "                return Violation(",
-                '                    tier="stpa",',
-                f'                    code="{uca_code}",',
-                f'                    message="{uca.description}",',
-                "                    kind=ViolationKind.HARD,",
-                "                )",
+                "            if val is not None:",
+                "                if isinstance(val, bool):",
+                "                    return Violation(",
+                '                        tier="stpa",',
+                f'                        code="{uca_code}",',
+                f'                        message="Boolean param `{param}` is not a valid numeric value.",',
+                "                        kind=ViolationKind.HARD,",
+                "                    )",
+                "                f_val = float(val)",
+                "                if not math.isfinite(f_val):",
+                "                    return Violation(",
+                '                        tier="stpa",',
+                f'                        code="{uca_code}",',
+                f'                        message="Non-finite param `{param}`.",',
+                "                        kind=ViolationKind.HARD,",
+                "                    )",
+                f"                if f_val > {cond.threshold}:",
+                "                    return Violation(",
+                '                        tier="stpa",',
+                f'                        code="{uca_code}",',
+                f'                        message="{uca.description}",',
+                "                        kind=ViolationKind.HARD,",
+                "                    )",
             ]
         elif param and op == "less_than" and cond.threshold_ref:
             attr_path = _qualify_threshold_ref(cond.threshold_ref, cs.system.domain)
@@ -1217,6 +1233,13 @@ def generate_python(cs: ControlStructureModel) -> str:
             body_lines += [
                 f'            val = params.get("{param}")',
                 "            if val is not None:",
+                "                if isinstance(val, bool):",
+                "                    return Violation(",
+                '                        tier="stpa",',
+                f'                        code="{uca_code}",',
+                f'                        message="Boolean param `{param}` is not a valid numeric value.",',
+                "                        kind=ViolationKind.HARD,",
+                "                    )",
                 "                f_val = float(val)",
                 "                if not math.isfinite(f_val):",
                 "                    return Violation(",
@@ -1457,10 +1480,11 @@ def generate_langgraph(cs: ControlStructureModel) -> str:
     stdlib_imports: list[str] = (
         [
             "import asyncio",
+            "import concurrent.futures",
             "import datetime",
             "import hashlib",
             "import logging",
-            "from collections.abc import Generator",
+            "from collections.abc import Coroutine, Generator",
             "from typing import Any",
         ]
         if needs_mcp_imports
@@ -1471,6 +1495,22 @@ def generate_langgraph(cs: ControlStructureModel) -> str:
             "from collections.abc import Generator",
             "from typing import Any",
         ]
+    )
+
+    run_async_helper_lines: list[str] = (
+        [
+            "def _run_async(coro: Coroutine[Any, Any, dict[str, Any]]) -> dict[str, Any]:",
+            '    """Run an async coroutine from a synchronous WAL generator node."""',
+            "    try:",
+            "        return asyncio.get_event_loop().run_until_complete(coro)",
+            "    except RuntimeError:",
+            "        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:",
+            "            return pool.submit(asyncio.run, coro).result()",
+            "",
+            "",
+        ]
+        if needs_mcp_imports
+        else []
     )
 
     lines: list[str] = [
@@ -1520,6 +1560,7 @@ def generate_langgraph(cs: ControlStructureModel) -> str:
         '    return (max(t["sequence_id"] for t in txns) + 1) if txns else 0',
         "",
         "",
+        *run_async_helper_lines,
     ]
 
     # -----------------------------------------------------------------------
@@ -1588,7 +1629,7 @@ def generate_langgraph(cs: ControlStructureModel) -> str:
                 "    # (Aho-Corasick → NeMo → STPA → OPA → CBF → Consensus → DoWhy)",
                 "    # before executing the action, ensuring atomicity guarantees are",
                 "    # proven in production and not merely declared in policy documents.",
-                "    result: dict[str, Any] = asyncio.get_event_loop().run_until_complete(",
+                "    result: dict[str, Any] = _run_async(",
                 "        _get_mcp_client().call_tool(",
                 f'            name="{saga.mcp_tool_name}",',
                 "            arguments={",

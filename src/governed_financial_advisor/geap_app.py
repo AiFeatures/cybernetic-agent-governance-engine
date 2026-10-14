@@ -292,7 +292,7 @@ class GovernedFinancialAdvisorGeapApp:
                 "messages": [("user", prompt)],
                 "user_id": user_id,
                 "execution_Mode": "advisor",
-                "Explainability_Mode": "verbos",
+                "Explainability_Mode": "verbose",
             }
             if safe_memories:
                 inputs["preloaded_memories"] = safe_memories
@@ -354,7 +354,7 @@ class GovernedFinancialAdvisorGeapApp:
                 "messages": [("user", prompt)],
                 "user_id": user_id,
                 "execution_Mode": "advisor",
-                "Explainability_Mode": "verbos",
+                "Explainability_Mode": "verbose",
             }
             if safe_memories:
                 inputs["preloaded_memories"] = safe_memories
@@ -400,19 +400,33 @@ class GovernedFinancialAdvisorGeapApp:
     ) -> dict[str, Any]:
         """Resume a paused HITL approval graph checkpoint on GEAP Agent Runtime."""
         graph = self._ensure_graph()
+        clean_thread_id = str(thread_id or "").strip()
+        if not clean_thread_id:
+            raise ValueError("thread_id must be a non-empty string")
+        normalized_decision = str(decision or "").strip().upper()
+        if normalized_decision in {"APPROVE", "APPROVED", "TRUE", "ALLOW"}:
+            approved = True
+        elif normalized_decision in {"REJECT", "REJECTED", "FALSE", "DENY", "DENIED"}:
+            approved = False
+        else:
+            raise ValueError(
+                f"Invalid decision {decision!r}; expected APPROVE/APPROVED or REJECT/REJECTED."
+            )
         validated = ApprovalDecision(
-            thread_id=thread_id,
-            decision=decision,  # type: ignore[arg-type]
-            approver_id=approver_id,
-            deferred_id=deferred_id,
-            reason=reason,
+            ticket_id=deferred_id,
+            approved=approved,
+            reviewer=approver_id,
+            rationale=reason
+            if reason is not None
+            else f"Decision: {normalized_decision}",
         )
-        config = {"configurable": {"thread_id": validated.thread_id}}
+        config = {"configurable": {"thread_id": clean_thread_id}}
         resume_payload = {
-            "decision": validated.decision,
-            "approver_id": validated.approver_id,
-            "deferred_id": validated.deferred_id,
-            "reason": validated.reason,
+            **validated.model_dump(),
+            "decision": normalized_decision,
+            "approver_id": validated.reviewer,
+            "deferred_id": validated.ticket_id,
+            "reason": validated.rationale,
         }
         final_state = await graph.ainvoke(Command(resume=resume_payload), config=config)
         messages = final_state.get("messages", [])
@@ -421,9 +435,10 @@ class GovernedFinancialAdvisorGeapApp:
             last_msg = messages[-1]
             response_text = getattr(last_msg, "content", str(last_msg))
         return {
-            "thread_id": validated.thread_id,
+            "thread_id": clean_thread_id,
             "status": "resumed",
-            "decision": validated.decision,
+            "decision": "APPROVED" if validated.approved else "REJECTED",
+            "approved": validated.approved,
             "response": response_text,
             "transaction_status": final_state.get("transaction_status"),
         }
@@ -454,7 +469,16 @@ def create_geap_runtime_router(
 
     @router.post("/api/reasoning_engine")
     async def handle_reasoning_engine(request: Request) -> JSONResponse:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except (ValueError, TypeError) as exc:
+            return JSONResponse(
+                {"error": f"Invalid JSON request body: {exc}"}, status_code=400
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "Request body must be a JSON object."}, status_code=400
+            )
         method_name = str(body.get("class_method") or "query")
         input_kwargs = body.get("input") or {}
         if not isinstance(input_kwargs, dict):
@@ -472,14 +496,26 @@ def create_geap_runtime_router(
         # Prefer async_query when "query" is invoked inside an active event loop
         target_name = "async_query" if method_name == "query" else method_name
         method = getattr(runtime_agent, target_name)
-        result = method(**input_kwargs)
-        if inspect.isawaitable(result):
-            result = await result
+        try:
+            result = method(**input_kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse({"output": jsonable_encoder(result)})
 
     @router.post("/api/stream_reasoning_engine")
     async def handle_stream_reasoning_engine(request: Request) -> Any:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except (ValueError, TypeError) as exc:
+            return JSONResponse(
+                {"error": f"Invalid JSON request body: {exc}"}, status_code=400
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "Request body must be a JSON object."}, status_code=400
+            )
         method_name = str(body.get("class_method") or "stream_query")
         input_kwargs = body.get("input") or {}
         if not isinstance(input_kwargs, dict):
@@ -495,6 +531,11 @@ def create_geap_runtime_router(
                 {"error": f"Stream method '{method_name}' not found on agent."},
                 status_code=400,
             )
+
+        try:
+            inspect.signature(runtime_agent.async_stream_query).bind(**input_kwargs)
+        except TypeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
 
         async def _ndjson_generator() -> AsyncIterator[str]:
             # Execute via async_stream_query when running inside FastAPI's event loop
