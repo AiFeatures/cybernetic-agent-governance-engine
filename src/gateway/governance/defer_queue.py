@@ -347,6 +347,7 @@ class DeferToken(BaseModel):
 
     # --- v3 additions (PRAXIS Phase 2) ------------------------------------
     upstream_permit_id: str | None = None
+    initiator_urn: str | None = None
 
     def is_authority_bound(self) -> bool:
         """Return True if bound to external upstream authority.
@@ -1127,6 +1128,20 @@ class DeferQueue:
         max_retries = 3
         base_jitter_ms = 5
 
+        if (
+            record.auth_method == "WEBAUTHN"
+            or record.client_data_json is not None
+            or record.challenge_binding is not None
+        ) and not record.verify_webauthn_challenge():
+            logger.warning(
+                "[defer_queue] WebAuthn challenge verification failed: defer_id=%s approver=%s",
+                defer_id,
+                record.approver_urn,
+            )
+            raise ValueError(
+                f"WebAuthn challenge binding verification failed for {record.approver_urn!r}"
+            )
+
         for attempt in range(max_retries):
             # Read current token state with revision
             token, current_status, revision = await self._read_token_with_rev(defer_id)
@@ -1156,6 +1171,25 @@ class DeferQueue:
                     current_status,
                 )
                 return (ApprovalStatus.NOT_FOUND, None)
+
+            # Separation-of-duties: the initiator who triggered the deferred action
+            # cannot approve their own token.
+            initiator = token.initiator_urn or token.opa_input_snapshot.get(
+                "initiator_urn"
+            )
+            if (
+                isinstance(initiator, str)
+                and initiator.strip()
+                and record.approver_urn == initiator.strip()
+            ):
+                logger.warning(
+                    "[defer_queue] Separation-of-duties violation: initiator %s attempted to approve defer_id=%s",
+                    record.approver_urn,
+                    defer_id,
+                )
+                raise ValueError(
+                    f"Separation-of-duties violation: initiator {record.approver_urn!r} cannot approve their own deferred token"
+                )
 
             # Check for duplicate approver
             existing_urns = {a.approver_urn for a in token.approvals}
